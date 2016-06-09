@@ -1,0 +1,35 @@
+#!/bin/bash
+
+# change $shake_home, $shake_perl_lib, $shake_code, $cancel_code in lib/ShakeConfig.pm
+# provide path to file that needs to be changed as argument.
+
+# first, comment out top of file and existing entries
+sed -i -e "1,12 s:^:#:" \
+       -e "s:^\$shake_home:#\$shake_home:" \
+       -e "s:^\$shake_perl_lib:#\$shake_perl_lib:" \
+       -e "s:^\$shake_code:#\$shake_code:" \
+       -e "s:^\$cancel_code:#\$cancel_code:" \
+       $1 
+
+# create the stuff at the top of the file
+echo "package ShakeConfig;" > /tmp/tempfile
+echo "use FindBin;" >> /tmp/tempfile
+echo "use Exporter ();" >> /tmp/tempfile
+echo "@ISA = qw(Exporter);" >> /tmp/tempfile
+echo "@EXPORT = qw(\$shake_home \$shake_perl_lib \$loc_db_conf \$loc_db_dirs 
+             \$config_dirs \$gmt_bin \$gs \$convertpath \$shake_code \$repeater_code 
+             \$cancel_code \$alarm_evt \$cancel_evt
+             \$GMTmajorVersion \$GMTminorVersion \$DEMdir \$PaperRegion
+             \$XMLencoding \$shakemap_version \$topo_dir);" >> /tmp/tempfile
+
+# add in the new definitions
+echo "\$shake_home     = \"\$FindBin::Bin/../..\";" >> /tmp/tempfile
+echo "\$shake_perl_lib = \"\$shake_home/ShakeMap/perl/lib\";" >> /tmp/tempfile
+echo "\$shake_code    = \"\$shake_home/ShakeMap/bin/shake\";" >> /tmp/tempfile
+echo "\$cancel_code   = \"\$shake_home/ShakeMap/bin/cancel\";" >> /tmp/tempfile
+
+# add old file to new file and then replace it.
+cat $1 >> /tmp/tempfile
+cp /tmp/tempfile $1
+rm /tmp/tempfile
+

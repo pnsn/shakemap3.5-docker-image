@@ -1,0 +1,2057 @@
+#!/usr/bin/perl
+
+#	@(#)transfer	1.46	01/11/07
+# Modified by jrhartog June 8, 2016, added optional ssh_privatekey parameter (for dest methods scp and rsync)
+# ssh_privatekey = full path to ssh private key file, always needed when using this docker image
+#    because this will typically run as root (docker group).
+# uses ssh option "-o StrictHostChecking=no" so that the first time it runs transfer in
+#    a container it won't fail due to prompting whether you want to add the host to your hosts file.
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use ShakeConfig;
+use lib "$shake_perl_lib";
+use Shake::Opt;
+use Shake::Die;
+use Shake::Common;
+use Shake::LoadConfig;
+use Shake::Version;
+use Shake::Password;
+use Shake::Source;
+use Shake::Info;
+
+use Cwd;
+use Net::FTP;
+use FileHandle;
+use File::Basename;
+use File::Path;
+use File::Copy;
+use XML::Writer;
+
+#######################################################################
+# Global variables
+#######################################################################
+
+my $arglist = "@ARGV";			# save the arguments for entry
+					# into the database
+
+#-----------------------------------------------------------------------
+#  dest:  { DEST     => 'machine.domain.wherever',
+#           TTYPE    => 'www | ftp | push',
+#           METHOD   => 'ftp | rcp | scp | rsync | cp',
+#	    USERNAME => 'userid',
+#	    FTP_PW   => 'passwd',
+#           OPTIONS  => '--opt=xyz etc.',
+#	    DESTDIR  => 'remote-directory',
+#	    DONE     => '0 | 1',
+#	    LISTNM   => 'list_name' }
+# flist:  { NAME    => 'list_name',
+#           SRC_DIR => 'directory',
+#           PATHS   => { 'path' => count,
+#                        ... },
+#           COPY    => 'true | false | undef',
+#	    FLIST   => [ { FILE => 'file',
+#			   TYPE => 'a | b' },
+#		           ... ] };
+#-----------------------------------------------------------------------
+my @dests;				# list of transfer actions
+my $cur_dest;				# the current transfer action
+					# being assembled
+
+my %flists;				# lists of files to transfer
+my $cur_flist;				# the current file list being
+					# assembled
+
+my $cfile   = 'transfer.conf';		# configuration file
+my $max_child_count = 10;		# max # of simultaneous forked 
+					# processes
+
+my $srcdir = "$shake_home/data";        # base directory for location of
+                                        # items to be transferred. Can be
+                                        # changed with 'sourcedirectory'
+                                        # setting in config file
+my %programs;				# list of paths to programs 
+
+my $password_file;			# file where passwords are stored
+my $pwobj;				# password object
+
+my @pushcmds;				# list of commands from the 
+					# 'pushcmd' config statement
+my @unpushcmds;				# list of commands from the 
+					# 'unpushcmd' config statement
+
+my $mapversion;				# The version of the map that
+					# we are currently working on
+
+# PDL configuration variables -- no defaults
+my ($pdl_java, $pdl_client, $pdl_source, $pdl_code, $pdl_config,
+    $pdl_eventsource, $pdl_eventsourcecode, $pdl_privatekey);
+my $pdl_type = 'shakemap';
+my $pdl_scenariotype = 'shakemap-scenario';
+
+my $maxwait = 60;			# Maximum wait for a transfer to
+                                        # a destination to complete
+#######################################################################
+# End global variables
+#######################################################################
+
+#######################################################################
+# Stuff to handle command line options and program documentation:
+#######################################################################
+
+my $desc = 'Transfer data files to web, ftp, and push destinations.';
+
+my $flgs = [{ FLAG => 'event',
+	      ARG  => 'event_id',
+              TYPE => 's',
+	      REQ  => 'y',
+	      DESC => 'Specifies the id of the event to process'},
+	    { FLAG => 'config',
+	      ARG  => 'path',
+              TYPE => 's',
+	      REQ  => 'y',
+	      DESC => 'Designates a config file to use in place of the '
+		    . 'defaults; if this file is not found, the program '
+		    . 'exits with an error.'},
+            { FLAG => 'www',
+              DESC => "Copy HTML and data files to web servers as specified "
+		    . "by the 'ttype : www' statements in transfer.conf."},
+            { FLAG => 'ftp',
+              DESC => 'Copy data files to ftp directories as specified '
+		    . "by the 'ttype : ftp' statements in transfer.conf."},
+            { FLAG => 'push',
+              DESC => 'Push data files to destinations as specified '
+		    . "by the 'ttype : push' statements in transfer.conf."},
+            { FLAG => 'pdl',
+              DESC => 'Send data to server(s) via PDL. You must have PDL '
+		    . 'installed and configured, and be registered with a '
+                    . 'PDL server to use this option.'},
+            { FLAG => 'permweb',
+              DESC => 'Transfer the static (i.e., non-event-specific) web '
+		    . 'components to the web server(s). No event id should '
+		    . 'be specified, and this option is incompatible with '
+		    . 'both -ftp and -push; -www is allowable, but '
+		    . 'redundant. -forget is implied by this option. '
+		    . 'Do not use this option with -cancel.'},
+            { FLAG => 'pending',
+              DESC => 'Transfer the pending page to the web site.'},
+            { FLAG => 'cancel',
+              DESC => "Undo the transfer of the specified flags (-www, -ftp, "
+		    . "-push) on the specified event."},
+            { FLAG => 'forget',
+              DESC => "Prevents the command-line options of this program "
+		    . "from being saved in the flag database."},
+            { FLAG => 'printcfg',
+              DESC => "Prints the destination and filelist info then quits."},
+            { FLAG => 'scenario',
+              DESC => 'Tell the system to treat this event as a scenario.'},
+            { FLAG => 'forcepush',
+              DESC => 'Force the program to push a scenario.'},
+            { FLAG => 'forcerun',
+              DESC => 'Override out-of-sequence and lock errors generated by '
+                    . 'Version.pm.'},
+            { FLAG => 'noversion',
+              DESC => 'By default, transfer creates a new version of the '
+                    . 'event (by calling setversion).  This flag suppresses '
+		    . 'the creation of a new version.'},
+            { FLAG => 'nofork',
+              DESC => 'Prevent fork()-related errors on some systems.'},
+            { FLAG => 'verbose',
+              DESC => 'Print more informational messages to stderr.'},
+            { FLAG => 'help',
+              DESC => 'Print program documentation and quit.'}
+           ];
+
+my $options = Opt::setOptions($flgs) or Die "Error in setOptions";
+
+if (defined $options->{'help'}) {
+  Opt::printDoc($desc);
+  exit 0;
+}
+
+#defined $options->{'event'}
+#        or Die "Must specify an event with -event flag";
+
+my $evid      = $options->{'event'};
+my $www       = defined $options->{'www'}       ? 1 : 0;
+my $ftp       = defined $options->{'ftp'}       ? 1 : 0;
+my $push      = defined $options->{'push'}      ? 1 : 0;
+my $pdl       = defined $options->{'pdl'}       ? 1 : 0;
+my $permweb   = defined $options->{'permweb'}   ? 1 : 0;
+my $pending   = defined $options->{'pending'}   ? 1 : 0;
+my $cancel    = defined $options->{'cancel'}    ? 1 : 0;
+my $forget    = defined $options->{'forget'}    ? 1 : 0;
+my $printcfg  = defined $options->{'printcfg'}  ? 1 : 0;
+my $scenario  = defined $options->{'scenario'}  ? 1 : 0;
+my $forcepush = defined $options->{'forcepush'} ? 1 : 0;
+my $forcerun  = defined $options->{'forcerun'}  ? 1 : 0;
+my $noversion = defined $options->{'noversion'} ? 1 : 0;
+my $nofork    = defined $options->{'nofork'}    ? 1 : 0;
+my $verbose   = defined $options->{'verbose'}   ? 1 : 0;
+
+$cfile = $options->{'config'} if defined $options->{'config'};
+
+my $evt_network = '';
+if (defined $evid) {
+  #----------------------------------------------------------------------
+  # Parse the event file
+  #----------------------------------------------------------------------
+  my $stationfile = "$srcdir/$evid/output/stationlist.xml";
+  if (not -e $stationfile) {
+    $stationfile = "$srcdir/$evid/input/event.xml";
+    if (not -e $stationfile) {
+      $stationfile = "$srcdir/$evid/input/stationlist.xml";
+    }
+    if (not -e $stationfile) {
+     Die "Can't find stationlist.xml or event.xml in $srcdir/$evid/input or output";
+    }
+  }
+  my $eqsrc = Source->new($stationfile) or Die "Couldn't parse $stationfile";
+  $evt_network = $eqsrc->network();
+
+  $srcdir .= "/$evid/genex";
+}
+else {
+  # can't save flags if no event id given, so don't try...
+  $forget = 1;
+}
+
+if (defined $evid) {
+  $scenario |= isScenario($evid);
+}
+
+Die "Unknown argument(s): @ARGV" if (@ARGV);
+
+#######################################################################
+# End of command line option stuff
+#######################################################################
+
+#######################################################################
+# Run the program
+#######################################################################
+
+main();
+
+#######################################################################
+# Subroutines
+#######################################################################
+
+sub main {
+
+  my $sv;
+  my $prog = basename($0);
+
+  if ($scenario and $push and not $forcepush) {
+    Print "Ignoring -push: To push a scenario you must use both '-push' and "
+      . "'-forcepush'";
+    $push = undef;
+  }
+
+  #----------------------------------------------------------------------
+  # There are various tricks to use -permweb
+  #----------------------------------------------------------------------
+  if ($permweb) {
+    $forget = 1;
+    $www    = 1;
+    Die "Quitting: cannot call -permweb with -ftp or -push." 
+		if ($push or $ftp);
+    Die "Quitting: cannot call -permweb with -cancel; web sites must\n"
+      . "be manually removed." 
+		if ($cancel);
+    Print "Warning: -permweb called with -evid; an event id is\n"
+	. "meaningless with -permweb; continuing..." if $evid;
+    undef $evid;
+  }
+
+  #-----------------------------------------------------------------------
+  # Parse the config file
+  #-----------------------------------------------------------------------
+  configure();
+
+  #-----------------------------------------------------------------------
+  # Check the configuration:
+  # Each destination should have a method, destdir, and list; 
+  # list should exist
+  # Each list should have at least one file, but it isn't fatal not to
+  #-----------------------------------------------------------------------
+  foreach my $dst ( @dests ) {
+    defined $dst->{TTYPE} 
+	or Die "Destination '$dst->{DEST}' no ttype specified";
+    defined $dst->{METHOD} 
+	or Die "Destination '$dst->{DEST}' no method specified";
+    defined $dst->{DESTDIR} 
+	or Die "Destination '$dst->{DEST}' no destdir specified";
+    defined $dst->{LISTNM} 
+	or Die "Destination '$dst->{DEST}' no list specified";
+    defined $flists{$dst->{LISTNM}}
+        or Die "Destination '$dst->{DEST}' list '$dst->{LISTNM}' not found";
+    if ($dst->{TTYPE} eq 'push' and $dst->{METHOD} ne 'ftp' 
+                                and $dst->{METHOD} ne 'cp') {
+      Die "ttype 'push' must use 'ftp' or 'cp' as 'method'";
+    }
+  }
+  foreach my $list ( keys %flists ) {
+    next if (( $permweb and $list ne 'permlist')
+	  or (!$permweb and $list eq 'permlist'));
+    unless (@{$flists{$list}->{FLIST}} > 0) {
+      Print "File list '$list' no files in list";
+      next;
+    }
+    defined $flists{$list}->{SRC_DIR}
+	or Die "Filelist '$list' no source directory specified";
+    #-----------------------------------------------------------------------
+    # For each file list, get a list of directories
+    #-----------------------------------------------------------------------
+    foreach my $ele ( @{$flists{$list}->{FLIST}} ) {
+      my $path = dirname($ele->{FILE});
+      next if not defined $path;
+      $flists{$list}->{PATHS}->{$path}++;
+    }
+  }
+
+  #----------------------------------------------------------------------
+  # Check that we can run this program, and set a lock (assuming we're
+  # not running in some auxiliary mode)
+  # $loc_db_conf and $config_dirs are defined in the ShakeConfig module
+  #----------------------------------------------------------------------
+  unless (not $evid or $forget) {
+    $sv = new Version($evid, $scenario, $loc_db_conf, $config_dirs)
+        or Die "Could not create Version object";
+    $sv->runProg($prog, $forcerun)
+        or Die "Problems in Shake::Version->runProg, quitting.";
+    $mapversion = $sv->getVersion();
+  }
+  if (not $mapversion) {
+    $mapversion = 1;
+  } else {
+    $mapversion++;
+  }
+
+  #-----------------------------------------------------------------------
+  # Create a Password object for use by FTP
+  #-----------------------------------------------------------------------
+  if (defined $password_file) {
+    $pwobj = Password->new($password_file) 
+		or Die "Unable to open password file $password_file";
+  }
+
+  if ($printcfg) {
+    print "Destinations:\n";
+    foreach my $dst ( @dests ) {
+      print "\t Destination: $dst->{DEST}\n";
+      print "\t Ttype: $dst->{TTYPE}\n";
+      print "\t Method: $dst->{METHOD}\n";
+      print "\t FTP: $dst->{USERNAME}\n";
+      print "\t Destdir: $dst->{DESTDIR}\n";
+      print "\t File list: $dst->{LISTNM}\n";
+    }
+    print "File lists:\n";
+    foreach my $list ( keys %flists ) {
+      print "\tName: $list\n";
+      print "\tDirectory: $flists{$list}->{SRC_DIR}\n";
+      print "\tCOPY DIR?: $flists{$list}->{COPY}\n";
+      foreach my $path ( keys %{$flists{$list}->{PATHS}} ) {
+        print "\tPath: $path\n";
+      }
+      foreach my $ele ( @{$flists{$list}->{FLIST}} ) {
+        print "\tFile: $ele->{FILE} \t $ele->{TYPE}\n";
+      }
+    }
+    exit 0;
+  }
+
+  make_contents() unless ($permweb or $pending);
+
+  my $dt = mydate();
+  Print "----- Starting Transfer for $evid at $dt -----";
+
+  if ($nofork) {  #### NON-FORKING VERSION ####
+
+    if ($pdl and run_cmd(\&do_pdl, "do_pdl")) {
+      Print "Error running PDL";
+    }
+      
+    foreach my $dst ( @dests ) {
+      #-----------------------------------------------------------------------
+      # Make sure the transfer type matches the invoking flag(s)
+      #-----------------------------------------------------------------------
+      next if (($dst->{TTYPE} eq 'www'  and not $www)
+            or ($dst->{TTYPE} eq 'ftp'  and not $ftp)
+            or ($dst->{TTYPE} eq 'push' and not $push));
+
+      if ($dst->{METHOD} eq 'ftp' 
+           and run_cmd(\&do_ftp,'do_ftp',$dst)) {
+	Print "Error in do_ftp for destination $dst->{DEST}";
+      } elsif ($dst->{METHOD} eq 'rcp' 
+           and run_cmd(\&do_rcp,'do_rcp','rcp', $dst)) {
+        Print "Error in do_rcp(rcp) for destination $dst->{DEST}";
+      } elsif ($dst->{METHOD} eq 'scp' 
+           and run_cmd(\&do_rcp,'do_rcp','scp', $dst)) {
+        Print "Error in do_rcp(scp) for destination $dst->{DEST}";
+      } elsif ($dst->{METHOD} eq 'rsync' 
+           and run_cmd(\&do_rsync,'do_rsync','rsync', $dst)) {
+	Print "Error in do_rsync for destination $dst->{DEST}";
+      } elsif ($dst->{METHOD} eq 'cp' 
+           and run_cmd(\&do_cp,'do_cp',$dst)) {
+	Print "Error in do_cp for destination $dst->{DEST}";
+      }
+    }
+  } else { #### FORKING VERSION ####
+    #-----------------------------------------------------------------------
+    # For each destination, fork and call do_* with the destination info
+    # and the list of files.
+    #-----------------------------------------------------------------------
+    my %children;
+    my $child_count = 0;
+    my $cpid;
+    $SIG{ALRM} = sub {
+      Print "Child processes exceeded timeout. Killing...";
+      kill 9, keys %children;
+      Print "Killed transfers to DESTS:\n" . join "\n", values %children;
+      while (wait > 0) { ; }
+      $child_count = 0;
+      %children = ();
+      die "Timeout";
+    };
+
+    #-----------------------------------------------------------------------
+    # This is a bit of a hack -- we trick the code below into treating
+    # a PDL transfer like one of the others
+    #-----------------------------------------------------------------------
+    my $d;
+    $d->{TTYPE} = 'pdl' if ($pdl);
+
+    foreach my $dst ( $d, @dests ) {
+      #-----------------------------------------------------------------------
+      # Make sure the transfer type matches the invoking flag(s)
+      #-----------------------------------------------------------------------
+      next if (not defined $dst or 
+               ($dst->{TTYPE} eq 'www'  and not $www)
+            or ($dst->{TTYPE} eq 'ftp'  and not $ftp)
+            or ($dst->{TTYPE} eq 'push' and not $push));
+      FORK: {
+        if (my $pid = fork) {
+          #---------------------------------------------------------------------
+          # parent
+          #---------------------------------------------------------------------
+          $children{$pid} = $dst->{DEST};
+          $child_count++;
+        } elsif (defined $pid) {
+          #---------------------------------------------------------------------
+          # child
+          #---------------------------------------------------------------------
+          if ($dst->{TTYPE} eq 'pdl') {
+            do_pdl();
+          } elsif ($dst->{METHOD} eq 'ftp') {
+	    if (do_ftp($dst) != 0) {
+	      Print "Error in do_ftp for destination $dst->{DEST}";
+	      exit 1;
+	    }
+          } elsif ($dst->{METHOD} eq 'rcp') {
+            if (do_rcp('rcp', $dst) != 0) {
+              Print "Error in do_rcp(rcp) for destination $dst->{DEST}";
+              exit 1;
+            }
+          } elsif ($dst->{METHOD} eq 'scp') {
+            if (do_rcp('scp', $dst) != 0) {
+              Print "Error in do_rcp(scp) for destination $dst->{DEST}";
+              exit 1;
+            }
+	  } elsif ($dst->{METHOD} eq 'rsync') {
+	    if (do_rsync('rsync', $dst) != 0) {
+	      Print "Error in do_rsync for destination $dst->{DEST}";
+	      exit 1;
+	    }
+	  } elsif ($dst->{METHOD} eq 'cp') {
+	    if (do_cp($dst) != 0) {
+	      Print "Error in do_cp for destination $dst->{DEST}";
+	      exit 1;
+	    }
+	  } else {
+	    Die "Unknown method $dst->{METHOD} for destination $dst->{DEST}";
+	  }
+          exit 0;
+        } elsif ($! =~ /No more process/) {
+          #--------------------------------------------------------------------
+          # EAGAIN, supposedly recoverable fork error
+          #--------------------------------------------------------------------
+          sleep 5;
+          redo FORK;
+        } else {
+          #--------------------------------------------------------------------
+          # fork error
+          #--------------------------------------------------------------------
+          Die "Can't fork: $!\n";
+        }
+      }
+      #-----------------------------------------------------------------------
+      # If we hit the maximum number of children, wait for one to finish
+      #-----------------------------------------------------------------------
+      if ($child_count >= $max_child_count) {
+        eval {
+          alarm $maxwait;
+          if (($cpid = wait) < 0) {
+            warn "No child processes???\n" 
+          } elsif ($? != 0) {
+            warn "Error in transfer to $children{$cpid}: returned $?\n" 
+          }
+          undef $children{$cpid};
+          $child_count--;
+          alarm 0;
+        };
+        if ($@) {
+          Print "Error: Child processes timed out";
+        }
+      }
+    }
+    #-----------------------------------------------------------------------
+    # Wait for the rest of the children to finish
+    #-----------------------------------------------------------------------
+    eval {
+      alarm $maxwait;
+      while ($child_count > 0) {
+        if (($cpid = wait) < 0) {
+          warn "No child processes???\n" 
+        } elsif ($? != 0) {
+          warn "Error in transfer to $children{$cpid}: returned $?\n" 
+        }
+        undef $children{$cpid};
+        $child_count--;
+      }
+      alarm 0;
+    };
+    if ($@) {
+      Print "Error: Child processes timed out";
+    }
+  }  #### END FORKING SECTION ####
+
+  $SIG{ALRM} = sub { die "Timeout"; };
+  if ($push) {
+    if ($cancel) {
+      foreach my $cmd ( @unpushcmds ) {
+        eval {
+          alarm $maxwait;
+          if (system $cmd) {
+	    Print "Error running command: '$cmd'";
+          }
+          alarm 0;
+        };
+        if ($@) {
+          Print "Error: unpushcmd timed out: $cmd";
+        }
+      }
+    } else {
+      foreach my $cmd ( @pushcmds ) {
+        eval {
+          alarm $maxwait;
+          if (system $cmd) {
+	    Print "Error running command: '$cmd'";
+          }
+          alarm 0;
+        };
+        if ($@) {
+          Print "Error: pushcmd timed out: $cmd";
+        }
+      }
+    }
+  }
+  $dt = mydate();
+  Print "----- Transfer finished $evid at $dt -----";
+
+  unless (not $evid or $forget) {
+    #----------------------------------------------------------------------
+    # To avoid problems with the automatic runs from 'shake', we don't 
+    # store the -noversion flag
+    #----------------------------------------------------------------------
+    $arglist =~ 
+	s/-(noversion|noversio|noversi|novers|nover|nove|nov)(\s|$)//;
+
+    $sv->saveFlags($prog, $arglist) or Die "Error: Couldn't save flags";
+    ($sv->setVersion("Automatic call from within transfer")
+		or Die("Error: couldn't set version"))
+    	unless $noversion;
+  }
+  return 0;
+}
+
+########################################################################
+# sub configure()
+# Read the config file and set the appropriate values
+########################################################################
+sub configure {
+
+  unshift @$config_dirs, "$shake_home/data/$evid/config" if $evid;
+  my $cfg  = new LoadConfig($cfile, $config_dirs, \&Print)
+                or Die "Couldn't open config file $cfile";
+
+  $cfg->parse( { 'password'            => \&password,
+		 'program'             => \&program,
+		 'destination'         => \&destination,
+		 'ttype'               => \&ttype,
+                 'method'              => \&method,
+                 'destdir'             => \&destdir,
+                 'list'                => \&list,
+                 'ssh_privatekey'      => \&ssh_privatekey,
+                 'senddone'            => \&senddone,
+		 'sourcedirectory'     => \&sourcedirectory,
+                 'filelist'            => \&filelist,
+                 'copydirectory'       => \&copydirectory,
+                 'directory'           => \&directory,
+                 'file'                => \&file,
+                 'pdl_java'            => \&pdl_java,
+                 'pdl_client'          => \&pdl_client,
+                 'pdl_source'          => \&pdl_source,
+                 'pdl_type'            => \&pdl_type,
+                 'pdl_scenariotype'    => \&pdl_scenariotype,
+                 'pdl_code'            => \&pdl_code,
+                 'pdl_eventsource'     => \&pdl_eventsource,
+                 'pdl_eventsourcecode' => \&pdl_eventsourcecode,
+                 'pdl_privatekey'      => \&pdl_privatekey,
+                 'pdl_config'          => \&pdl_config,
+                 'maxwait'             => \&maxwait,
+                 'pushcmd'             => \&pushcmd,
+                 'unpushcmd'           => \&unpushcmd } )
+        == 0 or Die "Error in config file, quitting...";
+
+  return 0;
+}
+
+########################################################################
+# sub fileList( <base_dir> )
+# Recursive subroutine to descend a directory tree and make a list of
+# all of the ordinary files found there.
+########################################################################
+sub fileList {
+
+  my $dir  = shift;
+  my $list = shift || [];
+
+  opendir THISDIR, "$dir" or die "Couldn't open $dir\n";
+  my @allfiles = grep !/^\.+$/, readdir THISDIR;
+  closedir THISDIR;
+  foreach my $file ( @allfiles ) {
+    my $path = "$dir/$file";
+    if (-d "$path") {
+      fileList($path, $list);
+    } else {
+      push @$list, $path;
+    }
+  }
+  return $list;
+}
+
+#######################################################################
+# sub do_ftp( <ref to destination object> )
+# Connect to host, transfer files
+#######################################################################
+sub do_ftp {
+
+  my $dst  = shift;
+  my $sent = 0;
+  my @dirs = sort by_depth keys %{$flists{$dst->{LISTNM}}->{PATHS}};
+  my @options = ( "Timeout", $maxwait );
+  my $fname;
+
+  push(@options, "Port", $dst->{PORT}) if defined $dst->{PORT};
+
+  my $nftp = Net::FTP->new($dst->{DEST}, @options) 
+		or Die "Couldn't connect to $dst->{DEST}";
+
+  #-----------------------------------------------------------------------
+  # Get the password, if necessary
+  #-----------------------------------------------------------------------
+  if (not defined $dst->{FTP_PW} or $dst->{FTP_PW} eq 'password') {
+    defined $pwobj 
+	or Die "No password available for $dst->{DEST}";
+    $dst->{FTP_PW} = $pwobj->password($dst->{DEST}, $dst->{USERNAME})
+    	or Die "Couldn't get password for $dst->{DEST} user $dst->{USERNAME}";
+  }
+
+  #-----------------------------------------------------------------------
+  # Move to the local src dir because filenames are relative to that
+  #-----------------------------------------------------------------------
+  my $sdir = "$srcdir/$flists{$dst->{LISTNM}}->{SRC_DIR}";
+  chdir "$sdir" or Die "do_ftp: can't cd to $sdir";
+
+  #-----------------------------------------------------------------------
+  # Login to the remote machine
+  #-----------------------------------------------------------------------
+  $nftp->login($dst->{USERNAME}, $dst->{FTP_PW}) 
+		or Die "Couldn't login to $dst->{DEST} as $dst->{USERNAME}";
+  if (not $cancel) {
+    $nftp->mkdir($dst->{DESTDIR}, "true") 
+		or Die "Couldn't make directory $dst->{DESTDIR}";
+  }
+  $nftp->cwd($dst->{DESTDIR}) 
+		or Die "Couldn't cd to $dst->{DESTDIR} on $dst->{DEST}";
+
+  #-----------------------------------------------------------------------
+  # If we're cancelling a push, all we need to do is put the .cancel file
+  #-----------------------------------------------------------------------
+  if($cancel and $dst->{TTYPE} eq 'push') {
+    $nftp->delete("$evid.cancel");  # Delete the possible previous copy
+    if ( $nftp->put("$shake_home/lib/transfer/cancelfile", '.temp') ) {
+      if ($nftp->rename('.temp', "$evid.cancel")) {
+        Print "Cancel push to $dst->{DEST} succeeded" if ($verbose);
+      }
+    } else {
+      Print "Couldn't put $evid.cancel file on $dst->{DEST}";
+    } 
+    $nftp->quit or
+	Print "Error quitting $dst->{DEST}; continuing...";
+    return 0;
+  }
+
+  #-----------------------------------------------------------------------
+  # Make the directory subtree
+  #-----------------------------------------------------------------------
+  if (not $cancel) {
+    if (not $dst->{TTYPE} eq 'push') {
+      for my $dir ( @dirs ) {
+        next if $dir eq ".";
+        $nftp->mkdir($dir, "true") or Print "Couldn't make directory $dir";
+      }
+    }
+  }
+
+  #-----------------------------------------------------------------------
+  # Send (or remove) each file in the transfer list
+  #-----------------------------------------------------------------------
+  for my $file ( @{$flists{$dst->{LISTNM}}->{FLIST}} ) {
+    next if not -e $file->{FILE};
+    #-----------------------------------------------------------------------
+    # Pushes need the event ID prepended unless the destdir contains it...
+    #-----------------------------------------------------------------------
+    if ($dst->{TTYPE} eq 'push') {
+      if ($dst->{DESTDIR} !~ /$evid/) {
+        $fname = getPushName($file->{FILE}, $evid);
+      } else {
+        $fname = basename($file->{FILE});
+      }
+    } else {
+      $fname = $file->{FILE};
+    }
+    if ($cancel) {
+      next if ($fname =~ /shake\/index\.html/
+            or $fname =~ /database\.html/);
+      $nftp->delete($fname)
+		or Die "Couldn't delete $fname from $dst->{DEST}";
+    } else {
+      $file->{TYPE} = 'b' if ($file->{FILE} =~ /\.zip$/
+			   or $file->{FILE} =~ /\.jpg$/);
+      if ($file->{TYPE} eq 'a') {
+        $nftp->ascii() or Die "Couldn't set ascii mode";
+      } else {
+        $nftp->binary() or Die "Couldn't set binary mode";
+      }
+      $nftp->put($file->{FILE}, '.temp')
+		or Die "Couldn't put $file->{FILE} on $dst->{DEST}";
+      $nftp->delete($fname);  # Delete the possible previous copy
+      $nftp->rename('.temp', $fname)
+		or Die "Couldn't rename to $fname";
+    }
+    $sent++;
+  }
+  if ($cancel) {
+    #-----------------------------------------------------------------------
+    # Hopefully this won't remove directories that aren't empty
+    #-----------------------------------------------------------------------
+    for my $dir ( @dirs ) {
+      next if $dir eq ".";
+      $nftp->rmdir($dir);
+    }
+  } else {
+    #-----------------------------------------------------------------------
+    # Send the 'eventid.done' file, if necessary
+    #-----------------------------------------------------------------------
+    if ($dst->{TTYPE} eq 'push' and
+        defined $dst->{DONE} and $dst->{DONE} == 1 and $sent > 0) {
+      $nftp->put("$shake_home/lib/transfer/donefile", '.temp')
+		or Die "Couldn't put done file on $dst->{DEST}";
+      $nftp->delete("$evid.done");  # Delete the possible previous copy
+      $nftp->rename('.temp', "$evid.done")
+		or Die "Couldn't rename to $evid.done";
+    }
+  }
+
+  $nftp->quit or Print "Error quitting $dst->{DEST}; continuing...";
+
+  if ($verbose) {
+    if ($cancel) {
+      Print "Cancel ftp to $dst->{DEST} succeeded: $sent files removed";
+    } else {
+      Print "Ftp to $dst->{DEST} succeeded: $sent files sent";
+    }
+  }
+  return 0;
+}
+
+#######################################################################
+# sub do_rcp( <scp | rcp>, <ref to destination object> )
+# transfer files via rsh or ssh and tar to remote host
+#######################################################################
+sub do_rcp {
+
+  my $method = shift;
+  my $dst    = shift;
+  my $remdir = "$dst->{DESTDIR}";
+  my $sdir   = "$srcdir/$flists{$dst->{LISTNM}}->{SRC_DIR}";
+  my $rsh    = $method eq 'rcp' ? $programs{'rsh'} : $programs{'ssh'};
+  my $tar    = $programs{'tar'};
+  my $fname;
+
+  if (not defined $rsh or not -x $rsh) {
+    Print "Error: to use $method, you must specify a valid path with "
+        . "the 'program' parameter in the config file.";
+    return -1;
+  }
+  if (not defined $tar or not -x $tar) {
+    Print "Error: to use $method, you must specify a valid path to the "
+        . "'tar' executable with the 'program' parameter in the config file.";
+    return -1;
+  }
+
+  $rsh .= " -x" if $method eq 'scp';
+  $rsh .= " -i $dst->{SSH_PRIVATEKEY}" if ($method eq 'scp' && defined $dst->{SSH_PRIVATEKEY});
+  $rsh .= " -o StrictHostKeyChecking=no" if $method eq 'scp';
+
+  if (defined $dst->{USERNAME}) {
+    $rsh .= " -l $dst->{USERNAME}";
+  }
+  $rsh .= " $dst->{DEST}";
+
+  #-----------------------------------------------------------------------
+  # Move to the local src dir because filenames are relative to that
+  #-----------------------------------------------------------------------
+  chdir "$sdir" or Die "do_rcp: can't cd to $sdir";
+
+  if (not $cancel) {
+    #-----------------------------------------------------------------------
+    # Copy tar file to remote
+    #-----------------------------------------------------------------------
+    my @dotfiles = <.[a-zA-Z0-9]>;
+    if(@dotfiles) {
+      `$tar chf - * .[a-zA-Z0-9]* | $rsh \"mkdir -p $remdir; cd $remdir; tar -xmf - \"`;
+    } else {
+      `$tar chf - * | $rsh \"mkdir -p $remdir; cd $remdir; tar -xmf - \"`;
+    }
+  } else {
+    #-----------------------------------------------------------------------
+    # Pick correct directory: this is either the www or the ftp transfer...
+    #-----------------------------------------------------------------------
+    Die "No evid specified in cancel" unless ($evid);
+    my $ddir = $dst->{DESTDIR};
+    if ($dst->{TTYPE} eq 'www') {
+      $ddir .= "/shake/$evid";
+    } else {
+      $ddir .= "/$evid";
+    }
+    #-----------------------------------------------------------------------
+    # rm -rf the directory
+    #-----------------------------------------------------------------------
+    `$rsh '\\rm -rf $ddir'`;
+  }
+
+  if ($verbose) {
+    if ($cancel) {
+      Print "Cancel rcp to $dst->{DEST} succeeded";
+    } else {
+      Print "rcp to $dst->{DEST} succeeded";
+    }
+  }
+  return 0;
+}
+
+#######################################################################
+# sub do_rsync( <rsync>, <ref to destination object> )
+# transfer files via ssh and rsync to remote host
+#######################################################################
+sub do_rsync {
+
+  my $method = shift;
+  my $dst    = shift;
+  my $remdir = "$dst->{DESTDIR}";
+  my $sdir   = "$srcdir/$flists{$dst->{LISTNM}}->{SRC_DIR}";
+  my $ssh    = $programs{'ssh'};
+  my $rsync  = $programs{'rsync'};
+  my $rshopt = $programs{'ssh'};
+  my ($fname, $destination);
+
+  if (not defined $ssh or not -x $ssh) {
+    Print "Error: to use rsync, you must specify a valid path to the 'ssh' "
+        . "executable with the 'program' parameter in the config file.";
+    return -1;
+  }
+  if (not defined $rsync or not -x $rsync) {
+    Print "Error: to use rsync, you must specify a valid path to the "
+	. "'rsync' executable with the 'program' parameter in the config file.";
+    return -1;
+  }
+  $ssh .= " -o StrictHostKeyChecking=no";
+  my $rshopt =  $ssh; 
+  $rshopt =  $rshopt . " -i $dst->{SSH_PRIVATEKEY}" if defined $dst->{SSH_PRIVATEKEY};
+  $rsync .= " --rsh=\"$rshopt\"";
+  $rsync .= " $dst->{OPTIONS}" if defined $dst->{OPTIONS};
+  $ssh   .= " -x";
+  $ssh   .= " -i $dst->{SSH_PRIVATEKEY}" if defined $dst->{SSH_PRIVATEKEY};
+
+  if (defined $dst->{USERNAME}) {
+    $ssh        .= " -l $dst->{USERNAME}";
+    $destination = "$dst->{USERNAME}\@";
+  }
+  $ssh         .= " $dst->{DEST}";
+  $destination .= "$dst->{DEST}";
+
+  #-----------------------------------------------------------------------
+  # Move to the local src dir because filenames are relative to that
+  #-----------------------------------------------------------------------
+  chdir "$sdir" or Die "do_rsync: can't cd to $sdir";
+
+  if (not $cancel) {
+    #-----------------------------------------------------------------------
+    # rsync files to remote
+    #-----------------------------------------------------------------------
+    Print "\`$rsync -ultgr * .[a-zA-Z0-9]* $destination:$remdir\`" 
+						if ($verbose);
+    `$ssh \"mkdir -p $remdir;\"`;
+    my @dotfiles = <.[a-zA-Z0-9]>;
+    if(@dotfiles) {
+      `$rsync -ultgr * .[a-zA-Z0-9]* $destination:$remdir`;
+    } else {
+      `$rsync -ultgr * $destination:$remdir`;
+    }
+  } else {
+    #-----------------------------------------------------------------------
+    # Pick correct directory: this is either the www or the ftp transfer...
+    #-----------------------------------------------------------------------
+    my $ddir = $dst->{DESTDIR};
+    if ($dst->{TTYPE} eq 'www') {
+      $ddir .= "/shake/$evid";
+    } else {
+      $ddir .= "/$evid";
+    }
+    #-----------------------------------------------------------------------
+    # rm -rf the directory
+    #-----------------------------------------------------------------------
+    `$ssh '\\rm -rf $ddir'`;
+  }
+
+  if ($verbose) {
+    if ($cancel) {
+      Print "Cancel rsync to $dst->{DEST} succeeded";
+    } else {
+      Print "rsync to $dst->{DEST} succeeded";
+    }
+  }
+  return 0;
+}
+
+#######################################################################
+# sub do_cp( <ref to destination object> )
+# transfer files via cp to local host
+#######################################################################
+sub do_cp {
+
+  my $dst  = shift;
+  my $sent = 0;
+  my $sdir = "$srcdir/$flists{$dst->{LISTNM}}->{SRC_DIR}";
+  my @dirs = sort by_depth keys %{$flists{$dst->{LISTNM}}->{PATHS}};
+  my $fname;
+
+  #-----------------------------------------------------------------------
+  # If we're cancelling a push, all we need to do is put the .cancel file
+  #-----------------------------------------------------------------------
+  if($cancel and $dst->{TTYPE} eq 'push') {
+    if (copy("$shake_home/lib/transfer/cancelfile", 
+	     "$dst->{DESTDIR}/$evid.cancel")) {
+      Print "Cancel push to $dst->{DEST} succeeded" if ($verbose);
+    } else {
+      Print "Error creating $evid.cancel in $dst->{DESTDIR}";
+    }
+    return 0;
+  }
+
+  chdir "$sdir" or Die "do_cp: can't cd to $sdir";
+
+  #-----------------------------------------------------------------------
+  # Make the needed subdirectories
+  #-----------------------------------------------------------------------
+  if (not $cancel) {
+    if (not -e $dst->{DESTDIR}) {
+      mkpath("$dst->{DESTDIR}", 0, 0755) or 
+	  Die "Error making directory $dst->{DESTDIR}";
+    }
+    if (not $dst->{TTYPE} eq 'push') {
+      for my $dir ( @dirs ) {
+        next if $dir eq ".";
+        if (not -e "$dst->{DESTDIR}/$dir") {
+          mkpath("$dst->{DESTDIR}/$dir", 0, 0755) or
+    	    Die "Error making directory $dst->{DESTDIR}/$dir";
+        }
+      }
+    }
+  }
+
+  #-----------------------------------------------------------------------
+  # Copy (or remove) each file
+  #-----------------------------------------------------------------------
+  for my $file ( @{$flists{$dst->{LISTNM}}->{FLIST}} ) {
+    next if not -e $file->{FILE};
+    #-----------------------------------------------------------------------
+    # Pushes need the event ID prepended unless the destdir contains it...
+    #-----------------------------------------------------------------------
+    if ($dst->{TTYPE} eq 'push') {
+      if ($dst->{DESTDIR} !~ /$evid/) {
+        $fname = getPushName($file->{FILE}, $evid);
+      } else {
+        $fname = basename($file->{FILE});
+      }
+    } else {
+      $fname = $file->{FILE};
+    }
+    if ($cancel) {
+      next if ($fname =~ /shake\/index\.html/
+            or $fname =~ /database\.html/);
+      unlink("$dst->{DESTDIR}/$fname") or
+    	Print "Error in unlink $fname from $dst->{DESTDIR}";
+    } else {
+      copy("$file->{FILE}", "$dst->{DESTDIR}/$fname") or
+    	Print "Error in copy $fname to $dst->{DESTDIR}/$fname";
+    }
+    $sent++;
+  }
+  if ($cancel) {
+    #-----------------------------------------------------------------------
+    # Remove directories, if possible
+    #-----------------------------------------------------------------------
+    for my $dir ( @dirs ) {
+      next if $dir eq ".";
+      rmdir "$dst->{DESTDIR}/$dir";
+    }
+    rmdir "$dst->{DESTDIR}";
+  } else {
+    #-----------------------------------------------------------------------
+    # Send the 'eventid.done' file, if necessary
+    #-----------------------------------------------------------------------
+    if ($dst->{TTYPE} eq 'push' and
+        defined $dst->{DONE} and $dst->{DONE} == 1 and $sent > 0) {
+      copy("$shake_home/lib/transfer/donefile", "$dst->{DESTDIR}/$evid.done") or
+    	Print "Error in copy done file to $dst->{DESTDIR}";
+    }
+  }
+
+  if ($verbose) {
+    if ($cancel) {
+      Print "Cancel cp to $dst->{DESTDIR} succeeded: $sent files removed";
+    } else {
+      Print "cp to $dst->{DESTDIR} succeeded: $sent files copied";
+    }
+  }
+  return 0;
+}
+
+#######################################################################
+# sub do_pdl()
+# transfer files via PDL
+#######################################################################
+sub do_pdl {
+
+  my $sdir = "$srcdir/web/shake/$evid";
+
+  if (not defined $pdl_java or
+      not defined $pdl_client or
+      not defined $pdl_source or
+      not defined $pdl_type or
+      not defined $pdl_scenariotype or
+      not defined $pdl_code or
+      not defined $pdl_eventsource or
+      not defined $pdl_eventsourcecode or
+      not defined $pdl_privatekey) {
+    Print "Error using -pdl: PDL not fully configured in transfer.conf.";
+    return -1;
+  }
+  my ($eid, $extension);
+
+  my $info = new Info($evid, 'read');
+  my $maxmmi = $info->value('mi_max');
+  my $process_timestamp = $info->value('process_time');
+  my $version = $info->value('map_version');
+  my $event_type = $info->value('event_type');
+  my $map_status = $info->value('map_status');
+  my $latitude = sprintf("%.6f", $info->value('latitude'));
+  my $longitude = sprintf("%.6f", $info->value('longitude'));
+  my $magnitude = $info->value('magnitude');
+  my $depth = $info->value('depth');
+  my $eventtime = $info->value('origin_time');
+  my $event_description = $info->value('event_description');
+  my $minimum_longitude = sprintf("%.6f", $info->value('lonmin'));
+  my $maximum_longitude = sprintf("%.6f", $info->value('lonmax'));
+  my $minimum_latitude = sprintf("%.6f", $info->value('latmin'));
+  my $maximum_latitude = sprintf("%.6f", $info->value('latmax'));
+
+  if (($eid, $extension) = $pdl_eventsourcecode =~ /(.+)~(.*)/) {
+    $pdl_eventsourcecode = $eid;
+  }
+
+  my $type = $scenario ? $pdl_scenariotype : $pdl_type;
+
+  my $cmd = "$pdl_java -jar $pdl_client --send --source=$pdl_source "
+          . "--type=$type --code=$pdl_code --eventsource=$pdl_eventsource "
+          . "--eventsourcecode=$pdl_eventsourcecode "
+          . "--privateKey=$pdl_privatekey "
+          . "--property-maxmmi=$maxmmi "
+          . "--property-process-timestamp=$process_timestamp "
+          . "--property-version=$version "
+          . "--property-event-type=$event_type "
+          . "--property-map-status=$map_status "
+          . "--property-latitude=$latitude "
+          . "--property-longitude=$longitude "
+          . "--property-magnitude=$magnitude "
+          . "--property-depth=$depth "
+          . "--property-eventtime=$eventtime "
+          . "--property-event-description='$event_description' "
+          . "--property-minimum-longitude=$minimum_longitude "
+          . "--property-maximum-longitude=$maximum_longitude "
+          . "--property-minimum-latitude=$minimum_latitude "
+          . "--property-maximum-latitude=$maximum_latitude ";
+  if (defined $pdl_config) {
+    $cmd .= " --configFile=$pdl_config";
+  }
+
+  if (not $cancel) {
+    $cmd .= " --directory=$sdir";
+  } else {
+    $cmd .= " --delete";
+  }
+
+  if (system $cmd) {
+    Print "Error running pdl: '$cmd'";
+    return -1;
+  }
+
+  if ($verbose) {
+    if ($cancel) {
+      Print "Cancel pdl succeeded";
+    } else {
+      Print "pdl transfer succeeded";
+    }
+  }
+  return 0;
+}
+
+sub by_depth {
+
+  my $acnt = 0;
+  my $bcnt = 0;
+
+  while ($a =~ m|/|g) {
+    $acnt++;
+  }
+  while ($b =~ m|/|g) {
+    $bcnt++;
+  }
+  return $bcnt <=> $acnt;
+}
+
+sub getPushName {
+
+  my $path = shift;
+  my $id   = shift;
+
+  my $name = basename($path);
+  if ($name eq 'grid.xyz' or $name eq 'grid.xyz.zip') {
+    $name = "$id.$name";
+  } elsif ($name eq 'event.txt') {
+    $name = "$id.txt";
+  } else {
+    $name = "${id}_$name";
+  }
+  return $name;
+}
+
+sub mydate {
+
+  my ($sec, $min, $hr, $day, $mon, $yr) = localtime();
+  return sprintf('%02d/%02d/%4d %02d:%02d:%02d',
+		 $mon + 1, $day, $yr + 1900, $hr, $min, $sec);
+}
+
+sub run_cmd {
+  my ($cmd, $cmdstr, @args) = @_;
+  my $ret = 0;
+
+  eval {
+    local $SIG{ALRM} = sub { die "Timeout"; };
+    alarm $maxwait;
+    $ret = &$cmd(@args);
+    alarm 0;
+  };
+  if ($@) {
+    Print "Error: Timeout running $cmdstr";
+    return -1;
+  }
+  return $ret;
+}
+
+#######################################################################
+# Configuration subroutines
+#######################################################################
+
+#######################################################################
+#  Structure of the destination objects:
+#  dest:  { DEST     => 'machine.domain.wherever',
+#           TTYPE    => 'www | ftp | push',
+#           METHOD   => 'ftp | rcp | scp | rsync | cp',
+#	    USERNAME => 'userid',
+#	    FTP_PW   => 'passwd',
+#           OPTIONS  => '--opt=xyz etc.',
+#	    DESTDIR  => 'remote-directory',
+#	    DONE     => '0 | 1',
+#           LISTNM   => 'list_name' }
+#
+#  list:  { NAME    => 'list_name',
+#           SRC_DIR => 'directory',
+#           PATHS   => { 'path' => count,
+#                        ... },
+#           COPY    => 'true | false | undef',
+#	    FLIST   => [ { FILE => 'file',
+#			   TYPE => 'a | b' },
+#		           ... ] };
+#######################################################################
+
+sub password {
+
+  my $pw = shift;
+
+  defined $pw or return "password: argument required";
+  $password_file = "$shake_home/$pw";
+  return undef;
+}
+
+sub program {
+
+  my ($method, $path) = split " ", shift;
+
+  (defined $method and defined $path) 
+			or return "program: 'method' and 'path' required";
+  $programs{$method} = $path;
+  return undef;
+}
+
+sub destination {
+
+  my ($dest, $port) = split " ", shift;
+  my $dref = {};
+
+  defined $dest or return "destination: argument required";
+  $dref->{DEST} = $dest;
+  $dref->{PORT} = $port if defined $port;
+  $cur_dest     = $dref;
+  push @dests, $dref;
+  return undef;
+}
+
+sub ttype {
+
+  my $ttype = shift;
+
+  defined $ttype or return "ttype: argument required";
+  defined $cur_dest or return "ttype called with no current destination";
+
+  return "ttype: unknown ttype '$ttype', must be one of 'www', 'ftp', 'push'"
+  		if (not grep $ttype eq $_, ('www', 'ftp', 'push'));
+  $cur_dest->{TTYPE} = $ttype;
+  return undef;
+}
+
+sub method {
+
+  my @args = split " ", shift;
+  my $meth = shift @args;
+
+  defined $meth or return "method: argument required";
+  defined $cur_dest or return "method called with no current destination";
+
+  $cur_dest->{METHOD} = $meth;
+  if ($meth eq 'ftp') {
+    $cur_dest->{USERNAME} = shift @args;
+    defined $cur_dest->{USERNAME} or return "method: 'ftp' requires username";
+    $cur_dest->{FTP_PW} = shift @args;
+  } elsif ($meth eq 'rcp' or $meth eq 'scp') {
+    $cur_dest->{USERNAME} = shift @args;
+  } elsif ($meth eq 'rsync') {
+    $cur_dest->{USERNAME} = shift @args;
+    $cur_dest->{OPTIONS}  = join " ", @args;
+  } elsif ($meth ne 'cp') {
+    return "method: unknown method '$meth'; must be one of 'ftp', 'rcp', "
+	 . "'scp', 'rsync' or 'cp'";
+  }
+  return undef;
+}
+
+sub ssh_privatekey {
+
+  my $privatekey = shift;
+  
+  (defined $privatekey and -e $privatekey) 
+       or return "ssh_privatekey: requires path to private key file";
+
+  $cur_dest->{SSH_PRIVATEKEY} = $privatekey;
+  return undef;
+}
+
+sub destdir {
+
+  my $dir = shift;
+
+  defined $dir or return "destdir: argument required";
+  defined $cur_dest or return "destdir called with no current destination";
+  if ($evid) { 
+    $dir =~ s/<EVID>/$evid/g;
+    $dir =~ s/<EVT_NETWORK>/$evt_network/g;
+    $dir =~ s/<VERSION>/$mapversion/g;
+  }
+  $dir =~ s/<SHAKE_HOME>/$shake_home/g;
+  $cur_dest->{DESTDIR} = $dir;
+  return undef;
+}
+
+sub list {
+
+  my $list = shift;
+
+  defined $list or return "list: argument required";
+  defined $cur_dest or return "list called with no current destination";
+
+  #-----------------------------------------------------------------------
+  # Hack a little bit more for -permweb: change the file list to permlist.
+  #-----------------------------------------------------------------------
+  if ($permweb) {
+    $cur_dest->{LISTNM} = 'permlist';
+  } else {
+    $cur_dest->{LISTNM} = $list;
+  }
+
+  return undef;
+}
+
+sub senddone {
+
+  my $bool = shift;
+
+  defined $bool or return "senddone: argument required";
+  defined $cur_dest or return "senddone called with no current destination";
+  ($cur_dest->{TTYPE} eq 'push' and $bool =~ /true/i)
+  	or return "senddone can only be set if ttype is 'push'";
+  if ($bool =~ /true/i) {
+    $cur_dest->{DONE} = 1;
+  } else {
+    $cur_dest->{DONE} = 0;
+  }
+  return undef;
+}
+
+sub sourcedirectory {
+  
+  my $dir = shift;
+
+  defined $dir or return "sourcedirectory: argument required";
+
+  $dir =~ s/<SHAKE_HOME>/$shake_home/g;
+
+  #-----------------------------------------------------------------------
+  # Hack for -permweb; this is the library directory where
+  # the permanent web files live
+  #-----------------------------------------------------------------------
+  $dir = "$shake_home/lib/genex/web" if $permweb;
+  
+  if (defined $evid) {
+    $srcdir = "$dir/$evid/genex";
+  }
+  else {
+    $srcdir = $dir;
+  }
+
+  return undef;
+}
+
+sub filelist {
+
+  my $name = shift;
+  my $lref = {};
+
+  defined $name or return "filelist: argument required";
+
+  $flists{$name} = $cur_flist = {};
+  $flists{$name}->{FLIST}     = [];
+  $flists{$name}->{PATHS}     = {};
+  return undef;
+}
+
+sub copydirectory {
+
+  my $copy = shift;
+
+  defined $copy or return "copydirectory: argument required";
+  defined $cur_flist 
+	or return "copydirectory called with no current file list";
+  $cur_flist->{COPY} = $copy;
+  return undef;
+}
+
+sub directory {
+
+  my ($dir, $type) = split " ", shift;
+
+  defined $dir or return "directory: argument required";
+  defined $cur_flist or return "directory called with no current filelist";
+  if ($evid) {
+    $dir =~ s/<EVID>/$evid/g;
+  }
+  $cur_flist->{SRC_DIR} = $dir;
+
+  #-----------------------------------------------------------------------
+  # A bit more -permweb hacking -- the other filelists will not
+  # be valid, so we skip them; the opposite is also true: the 
+  # permanent directory won't be there unless we're in -permweb.
+  #-----------------------------------------------------------------------
+  if (( $permweb and $dir !~ /permanent/)
+   or (!$permweb and $dir =~ /permanent/)) {
+    return undef;
+  }
+
+  if (defined $cur_flist->{COPY} and $cur_flist->{COPY} eq 'true') {
+    my $curdir = cwd();
+#    chdir "$srcdir/$dir" or return "directory: can't cd to $srcdir/$dir";
+    my $list;
+    if (chdir "$srcdir/$dir") {
+      $list = fileList('.');
+    } 
+    $type = 'b' if (not defined $type);
+
+    foreach my $file ( @$list ) {
+      my $ele = {};
+      $ele->{FILE} = $file;
+      $ele->{TYPE} = $type;
+      push @{$cur_flist->{FLIST}}, $ele;
+    }
+    chdir $curdir;
+  }
+  return undef;
+}
+
+sub file {
+
+  my ($file, $type) = split " ", shift;
+  my $found = 0;
+
+  defined $file 
+		or return "file: argument required";
+  defined $cur_flist 
+		or return "file called with no current filelist";
+  defined $cur_flist->{SRC_DIR} 
+		or return "file called with no current directory";
+
+  if ($evid) {
+    $file =~ s/<EVID>/$evid/g;
+  }
+  $type = 'b' if (not defined $type);
+
+  foreach my $ele ( @{$cur_flist->{FLIST}} ) {
+    if ($ele->{FILE} =~ /$file/) {
+      $ele->{TYPE} = $type;
+      $found++;
+      last;
+    }
+  }
+  if (not $found) {
+    my $ele = {};
+    $ele->{FILE} = $file;
+    $ele->{TYPE} = $type;
+    push @{$cur_flist->{FLIST}}, $ele;
+  }
+  return undef;
+}
+
+sub pdl_java {
+
+  my $java = shift;
+  
+  (defined $java and -x $java) 
+       or return "pdl_java: requires path to java executable";
+
+  $pdl_java = $java;
+  return undef;
+}
+
+sub pdl_client {
+
+  my $client = shift;
+  
+  (defined $client and -e $client) 
+       or return "pdl_client: requires path to PDL client";
+
+  $pdl_client = $client;
+  return undef;
+}
+
+sub pdl_source {
+
+  my $source = shift;
+  
+  defined $source or return "pdl_source: requires argument";
+
+  $pdl_source = $source;
+  return undef;
+}
+
+sub pdl_type {
+
+  my $type = shift;
+  
+  defined $type or return "pdl_type: requires argument";
+
+  $pdl_type = $type;
+  return undef;
+}
+
+sub pdl_scenariotype {
+
+  my $scenariotype = shift;
+  
+  defined $scenariotype or return "pdl_scenariotype: requires argument";
+
+  $pdl_scenariotype = $scenariotype;
+  return undef;
+}
+
+sub pdl_code {
+
+  my $code = shift;
+  
+  defined $code or return "pdl_code: requires argument";
+
+  my $myevid = $evid;
+  if ($evt_network ne '') {
+    $myevid =~ s/^$evt_network//;
+  }
+
+  $code =~ s/<EVENT>/$myevid/g;
+  $code =~ s/<EVT_NETWORK>/$evt_network/g;
+  $pdl_code = $code;
+  return undef;
+}
+
+sub pdl_eventsource {
+
+  my $eventsource = shift;
+  
+  defined $eventsource or return "pdl_eventsource: requires argument";
+
+  $eventsource =~ s/<EVT_NETWORK>/$evt_network/g;
+  $pdl_eventsource = $eventsource;
+  return undef;
+}
+
+sub pdl_eventsourcecode {
+
+  my $eventsourcecode = shift;
+  
+  defined $eventsourcecode or return "pdl_eventsourcecode: requires argument";
+
+  my $myevid = $evid;
+  if ($evt_network ne '') {
+    $myevid =~ s/^$evt_network//;
+  }
+
+  $eventsourcecode =~ s/<EVENT>/$myevid/g;
+  $pdl_eventsourcecode = $eventsourcecode;
+  return undef;
+}
+
+sub pdl_privatekey {
+
+  my $privatekey = shift;
+  
+  (defined $privatekey and -e $privatekey) 
+       or return "pdl_privatekey: requires path to private key file";
+
+  $pdl_privatekey = $privatekey;
+  return undef;
+}
+
+sub pdl_config {
+
+  my $config = shift;
+  
+  (defined $config and -e $config) 
+       or return "pdl_config: requires path to PDL config file";
+
+  $pdl_config = $config;
+  return undef;
+}
+
+sub maxwait {
+
+  my $wait = shift;
+
+  (defined $wait and $wait > 0)
+       or return "maxwait: must be a number (seconds) > 0";
+
+  $maxwait = $wait;
+  return undef;
+}
+
+sub pushcmd {
+
+  my $command = shift;
+
+  defined $command or return "pushcmd: argument required";
+
+  $command =~ s/<EVENT>/$evid/g;
+  $command =~ s/<EVID>/$evid/g;
+  $command =~ s/<VERSION>/$mapversion/g;
+  $command =~ s/<EVT_NETWORK>/$evt_network/g;
+  push @pushcmds, $command;
+  return undef;
+}
+
+sub unpushcmd {
+
+  my $command = shift;
+
+  defined $command or return "unpushcmd: argument required";
+  $command =~ s/<EVENT>/$evid/g;
+  $command =~ s/<EVID>/$evid/g;
+  $command =~ s/<VERSION>/$mapversion/g;
+  $command =~ s/<EVT_NETWORK>/$evt_network/g;
+
+  push @unpushcmds, $command;
+  return undef;
+}
+
+#######################################################################
+# End configuration subroutines
+#######################################################################
+
+sub make_contents {
+
+  #----------------------------------------------------------------------
+  # Create contents.xml
+  #----------------------------------------------------------------------
+  my $lowd = cwd;
+  chdir "$shake_home/data/$evid/genex/web/shake/$evid/download"
+                or Die("Unable to access $evid download dir from $lowd");
+  #----------------------------------------------------------------------
+  # Open the output file, contents.xml
+  #----------------------------------------------------------------------
+  my $fh = new IO::File "> ../contents.xml"
+                  or Die "Couldn't open ../contents.xml";
+  #----------------------------------------------------------------------
+  # Create the XML::Writer object, direct output to the contents.xml file
+  #----------------------------------------------------------------------
+  my $writer = new XML::Writer(OUTPUT => \*$fh, DATA_MODE => 1,
+                               DATA_INDENT => "  ");
+  $writer->xmlDecl($XMLencoding);
+  $writer->startTag("contents");
+  #----------------------------------------------------------------------
+  # XML data grids
+  #----------------------------------------------------------------------
+  if (-e 'grid.xml' or -e 'grid.xml.zip') {
+    $writer->startTag("file", "title" => "XML Grids", "id" => "xmlGrids");
+    $writer->startTag("caption");
+    $writer->cdata("XML grids of ground motions");
+    $writer->endTag();
+    if (-e 'grid.xml') {
+      $writer->emptyTag("format", "href" => "download/grid.xml",
+                        "type" => "text/xml");
+    }
+    if (-e 'grid.xml.zip') {
+      $writer->emptyTag("format", "href" => "download/grid.xml.zip",
+                        "type" => "application/zip");
+    }
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # The rock_grid
+  #----------------------------------------------------------------------
+  if (-e 'rock_grid.xml.zip') {
+    $writer->startTag("file", "title" => "Rock Grid",
+                      "id" => "rockGrid");
+    $writer->startTag("caption");
+    $writer->cdata("XML grid of intensity/ground motions on rock");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/rock_grid.xml.zip",
+                      "type" => "application/zip");
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # The uncertainty grid
+  #----------------------------------------------------------------------
+  if (-e 'uncertainty.xml.zip') {
+    $writer->startTag("file", "title" => "Uncertainty Grid",
+                      "id" => "uncertaintyGrid");
+    $writer->startTag("caption");
+    $writer->cdata("XML grid of uncertainties");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/uncertainty.xml.zip",
+                      "type" => "application/zip");
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # Text grid
+  #----------------------------------------------------------------------
+  if (-e 'grid.xyz.zip') {
+    $writer->startTag("file", "title" => "Text Grids", "id" => "textGrids");
+    $writer->startTag("caption");
+    $writer->cdata("ASCII grid of ground motions");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/grid.xyz.zip",
+                      "type" => "application/zip");
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # KML/KMZ for Google Earth
+  #----------------------------------------------------------------------
+  if (-e "$evid.kml") {
+    $writer->startTag("file", "title" => "KML File",
+                      "id" => "kmlFile");
+    $writer->startTag("caption");
+    $writer->cdata("KML for Google Earth");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/$evid.kml",
+                      "type" => "application/vnd.google-earth.kml+xml");
+    $writer->endTag();
+  }
+  if (-e "$evid.kmz") {
+    $writer->startTag("file", "title" => "Event KMZ File",
+                      "id" => "kmzEventFile");
+    $writer->startTag("caption");
+    $writer->cdata("KMZ for Google Earth");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/$evid.kmz",
+                      "type" => "application/vnd.google-earth.kmz");
+    $writer->endTag();
+  }
+  if (-e "epicenter.kmz") {
+    $writer->startTag("file", "title" => "Epicenter KMZ File",
+                      "id" => "kmzEpicenterFile");
+    $writer->startTag("caption");
+    $writer->cdata("Epicenter KMZ for Google Earth");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/epicenter.kmz",
+                      "type" => "application/vnd.google-earth.kmz");
+    $writer->endTag();
+  }
+  if (-e "fault.kmz") {
+    $writer->startTag("file", "title" => "Fault KMZ File",
+                      "id" => "kmzFaultFile");
+    $writer->startTag("caption");
+    $writer->cdata("Fault KMZ for Google Earth");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/fault.kmz",
+                      "type" => "application/vnd.google-earth.kmz");
+    $writer->endTag();
+  }
+  if (-e "overlay.kmz") {
+    $writer->startTag("file", "title" => "Intensity Overlay KMZ File",
+                      "id" => "kmzOverlayFile");
+    $writer->startTag("caption");
+    $writer->cdata("Intensity Overlay KMZ for Google Earth");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/overlay.kmz",
+                      "type" => "application/vnd.google-earth.kmz");
+    $writer->endTag();
+  }
+  if (-e "polygons_mi.kmz") {
+    $writer->startTag("file", "title" => "Intensity Polygons KMZ",
+                      "id" => "kmzPolygonsMI");
+    $writer->startTag("caption");
+    $writer->cdata("Intensity Polygons KMZ for Google Earth");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/polygons_mi.kmz",
+                      "type" => "application/vnd.google-earth.kmz");
+    $writer->endTag();
+  }
+  if (-e "stations.kmz") {
+    $writer->startTag("file", "title" => "Stations KMZ File",
+                      "id" => "kmzStationsFile");
+    $writer->startTag("caption");
+    $writer->cdata("Stations KMZ for Google Earth");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/stations.kmz",
+                      "type" => "application/vnd.google-earth.kmz");
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # Shape files
+  #----------------------------------------------------------------------
+  if (-e "shape.zip") {
+    $writer->startTag("file", "title" => "GIS Files",
+                      "id" => "gisFiles");
+    $writer->startTag("caption");
+    $writer->cdata("General-purpose GIS shape files");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/shape.zip",
+                      "type" => "application/zip");
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # Hazus files
+  #----------------------------------------------------------------------
+  if (-e "hazus.zip") {
+    $writer->startTag("file", "title" => "HAZUS Data",
+                      "id" => "hazusData");
+    $writer->startTag("caption");
+    $writer->cdata("Data files for HAZUS loss estimation");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/hazus.zip",
+                      "type" => "application/zip");
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # ESRI Raster files
+  #----------------------------------------------------------------------
+  if (-e "raster.zip") {
+    $writer->startTag("file", "title" => "ESRI Raster Files",
+                      "id" => "rasterData");
+    $writer->startTag("caption");
+    $writer->cdata("Data and uncertainty grids in ESRI raster format");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/raster.zip",
+                      "type" => "application/zip");
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # Station Lists
+  #----------------------------------------------------------------------
+  if (-e "stationlist.txt" or -e "stationlist.xml" or -e "stationlist.json") {
+    $writer->startTag("file", "title" => "Station Lists",
+                      "id" => "stationLists");
+    $writer->startTag("caption");
+    $writer->cdata("Lists of input data");
+    $writer->endTag();
+    if (-e "stationlist.txt") {
+      $writer->emptyTag("format", "href" => "download/stationlist.txt",
+                        "type" => "text/plain");
+    }
+    if (-e "stationlist.xml") {
+      $writer->emptyTag("format", "href" => "download/stationlist.xml",
+                        "type" => "text/xml");
+    }
+    if (-e "stationlist.json") {
+      $writer->emptyTag("format", "href" => "download/stationlist.json",
+                        "type" => "application/json");
+    }
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # Metadata
+  #----------------------------------------------------------------------
+  if (-e "metadata.txt" or -e "metadata.xml" or -e "metadata.html") {
+    $writer->startTag("file", "title" => "Metadata",
+                      "id" => "metadata");
+    $writer->startTag("caption");
+    $writer->cdata("FGDC-compliant metadata");
+    $writer->endTag();
+    if (-e "metadata.txt") {
+      $writer->emptyTag("format", "href" => "download/metadata.txt",
+                        "type" => "text/plain");
+    }
+    if (-e "metadata.xml") {
+      $writer->emptyTag("format", "href" => "download/metadata.xml",
+                        "type" => "text/xml");
+    }
+    if (-e "metadata.html") {
+      $writer->emptyTag("format", "href" => "download/metadata.html",
+                        "type" => "text/html");
+    }
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # Info.xml
+  #----------------------------------------------------------------------
+  if (-e "info.json") {
+    $writer->startTag("file", "title" => "Supplemental Information",
+                      "id" => "supplemantalInformation");
+    $writer->startTag("caption");
+    $writer->cdata("ShakeMap processing parameters and map summary information.");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/info.json",
+                      "type" => "text/json");
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # TV Guide
+  #----------------------------------------------------------------------
+  if (-e "tvguide.txt") {
+    $writer->startTag("file", "title" => "TV Info Sheet",
+                      "id" => "tvinfoSheet");
+    $writer->startTag("caption");
+    $writer->cdata("ShakeMap information for reporters.");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/tvguide.txt",
+                      "type" => "text/plain");
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # Fault file
+  #----------------------------------------------------------------------
+  my $ff = <*_fault.txt>;
+  if (defined $ff) {
+    $writer->startTag("file", "title" => "Fault File",
+                    "id" => "faultFile");
+    $writer->startTag("caption");
+    $writer->cdata("Finite fault coordinates [lat lon depth(km)].");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/$ff",
+                      "type" => "text/plain");
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # JPEG and PS maps
+  #----------------------------------------------------------------------
+  my @jpgmaps = <*.jpg>;
+  my ($jpgmap, $map);
+  my %titles = (
+     'pga' => 'PGA Map',
+     'pgv' => 'PGV Map',
+     'psa03' => 'PSA03 Map',
+     'psa10' => 'PSA10 Map',
+     'psa30' => 'PSA30 Map',
+     'intensity' => 'Intensity Map',
+     'tvmap' => 'TV Map',
+     'tvmap_bare' => 'Bare TV Map',
+     'urat_pga' => 'Uncertainty Map' );
+  my %ids = (
+     'pga' => 'pgaMap',
+     'pgv' => 'pgvMap',
+     'psa03' => 'psa03Map',
+     'psa10' => 'psa10Map',
+     'psa30' => 'psa30Map',
+     'intensity' => 'intensityMap',
+     'tvmap' => 'tvMap',
+     'tvmap_bare' => 'baretvMap',
+     'urat_pga' => 'uncertaintyMap' );
+  my %captions = (
+     'pga'   => 'Map of peak ground acceleration (%g).',
+     'pgv'   => 'Map of peak ground velocity (cm/s).',
+     'psa03' => 'Map of 0.3 sec 5% damped pseudo-spectral acceleration(%g).',
+     'psa10' => 'Map of 1.0 sec 5% damped pseudo-spectral acceleration(%g).',
+     'psa30' => 'Map of 3.0 sec 5% damped pseudo-spectral acceleration(%g).',
+     'intensity' => 'Map of macroseismic intensity.',
+     'tvmap' => 'Large format map of macroseismic intensity suitable for television broadcast.',
+     'tvmap_bare' => 'Large format undecorated map of macroseismic intensity suitable for television broadcast.',
+     'urat_pga' => 'Map of PGA uncertainty.' );
+
+  foreach $jpgmap ( @jpgmaps ) {
+    $map = basename($jpgmap, '.jpg');
+    next if ($map eq 'sd' or $map eq 'ii_thumbnail');
+    $writer->startTag("file", "title" => "$titles{$map}",
+                    "id" => "$ids{$map}");
+    $writer->startTag("caption");
+    $writer->cdata("$captions{$map}");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/$jpgmap",
+                      "type" => "image/jpeg");
+    if ($map eq 'intensity') {
+      $writer->emptyTag("format", "href" => "download/ii_thumbnail.jpg",
+                        "type" => "image/jpeg");
+    }
+    if (-e "$map.ps.zip") {
+      $writer->emptyTag("format", "href" => "download/$map.ps.zip",
+                        "type" => "application/zip");
+    }
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # Contour files; GeoJSON 
+  #----------------------------------------------------------------------
+  my @contours = <cont_*.json>;
+  my ($cntr, $bn);
+  %titles = (
+     'cont_mi'  => 'Intensity Contours',
+     'cont_pga' => 'PGA Contours',
+     'cont_pgv' => 'PGV Contours',
+     'cont_psa03' => 'PSA03 Contours',
+     'cont_psa10' => 'PSA10 Contours',
+     'cont_psa30' => 'PSA30 Contours' );
+  %ids = (
+     'cont_mi'  => 'miContour',
+     'cont_pga' => 'pgaContour',
+     'cont_pgv' => 'pgvContour',
+     'cont_psa03' => 'psa03Contour',
+     'cont_psa10' => 'psa10Contour',
+     'cont_psa30' => 'psa30Contour' );
+  %captions = (
+     'cont_mi' => 'Contours of macroseismic intensity.',
+     'cont_pga'   => 'Contours of peak ground acceleration (%g).',
+     'cont_pgv'   => 'Contours of peak ground velocity (cm/s).',
+     'cont_psa03' => 'Contours of 0.3 sec 5% damped pseudo-spectral acceleration(%g).',
+     'cont_psa10' => 'Contours of 1.0 sec 5% damped pseudo-spectral acceleration(%g).',
+     'cont_psa30' => 'Contours of 3.0 sec 5% damped pseudo-spectral acceleration(%g).' );
+
+  foreach $cntr ( @contours ) {
+    $bn = basename($cntr, '.json');
+    $writer->startTag("file", "title" => "$titles{$bn}",
+                    "id" => "$ids{$bn}");
+    $writer->startTag("caption");
+    $writer->cdata("$captions{$bn}");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/$cntr",
+                        "type" => "application/json");
+    if (-e "$bn.kmz") {
+      $writer->emptyTag("format", "href" => "download/$bn.kmz",
+                        "type" => "application/vnd.google-earth.kmz");
+    }
+    $writer->endTag();
+  }
+  #----------------------------------------------------------------------
+  # Plotregr plots -- if they're there...
+  #----------------------------------------------------------------------
+  my @regrs = <*_regr.png>;
+  my ($regr, $bn);
+  %titles = (
+     'mi_regr'    => 'Intensity Regression',
+     'pga_regr'   => 'PGA Regression',
+     'pgv_regr'   => 'PGV Regression',
+     'psa03_regr' => 'PSA03 Regression',
+     'psa10_regr' => 'PSA10 Regression',
+     'psa30_regr' => 'PSA30 Regression' );
+  %ids = (
+     'mi_regr'    => 'miRegr',
+     'pga_regr'   => 'pgaRegr',
+     'pgv_regr'   => 'pgvRegr',
+     'psa03_regr' => 'psa03Regr',
+     'psa10_regr' => 'psa10Regr',
+     'psa30_regr' => 'psa30Regr' );
+  %captions = (
+     'mi_regr'    => 'Plot of macroseismic intensity vs distance.',
+     'pga_regr'   => 'Plot of peak ground acceleration vs distance.',
+     'pgv_regr'   => 'Plot of peak ground velocity vs distance.',
+     'psa03_regr' => 'Plot of 0.3 sec pseudo-spectral acceleration vs distance.',
+     'psa10_regr' => 'Plot of 1.0 sec pseudo-spectral acceleration vs distance.',
+     'psa30_regr' => 'Plot of 3.0 sec pseudo-spectral acceleration vs distance.' );
+
+  foreach $regr ( @regrs ) {
+    $bn = basename($regr, '.png');
+    $writer->startTag("file", "title" => "$titles{$bn}",
+                    "id" => "$ids{$bn}");
+    $writer->startTag("caption");
+    $writer->cdata("$captions{$bn}");
+    $writer->endTag();
+    $writer->emptyTag("format", "href" => "download/$regr",
+                      "type" => "image/png");
+    $writer->endTag();
+  }
+
+  #----------------------------------------------------------------------
+  #----------------------------------------------------------------------
+
+  $writer->endTag(); # contents
+  $writer->end();
+  $fh->close;
+
+  chdir $lowd or Die "Unable to return to directory $lowd -- $!";
+}

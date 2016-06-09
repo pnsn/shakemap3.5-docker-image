@@ -1,0 +1,7 @@
+#!/bin/bash
+sed -i -e "s:GMTLIB  = /usr/local/lib:GMTLIB = ${GMTDIR}/lib:" \
+       -e "s:GMTINC  = /usr/local/include:GMTINC = ${GMTDIR}/include:" \
+       -e "s:CDFLIB = /usr/include/lib:CDFLIB = /usr/lib64:" \
+       -e "s:CDFINC = /usr/include/netcdf.h:CDFINC = /usr/include:" \
+       -e "s:GMT_VERSION = 4.4:GMT_VERSION = ${GMT_VERSION}:" \
+       $1

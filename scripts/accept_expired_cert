@@ -1,0 +1,8 @@
+#!/usr/bin/expect -f
+
+set svn_url https://vault.gps.caltech.edu/repos/products/shakemap/tags/release-3.5/
+
+spawn svn list ${svn_url}
+expect "(R)eject, accept (t)emporarily or accept (p)ermanently? "
+send -- "p\r"
+expect -re "root@.*:\/#"

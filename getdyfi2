@@ -1,0 +1,177 @@
+#!/usr/bin/env python
+# Modified by jrhartog 2016-06-08:
+# -path to data dir can now be changed by setting SHAKE_HOME environment variable.
+# -added network argument to getcdifile and altered URL to prepend network code to eventid
+# -exits with error message when run without -event option
+#
+from xml.dom import minidom
+import sys
+if sys.version_info.major == 3:
+    import urllib.request as request
+else:
+    import urllib2 as request
+import os
+import json
+import datetime
+import time
+import calendar
+import argparse
+
+URLT = 'http://earthquake.usgs.gov/earthquakes/feed/v1.0/detail/[NETWORK][EVENTID].geojson'
+
+def getcdifile(network,eventid,code_version,shake_version,minresp=3,cdifile=None):
+    url = URLT.replace('[EVENTID]',eventid)
+    url = url.replace('[NETWORK]',network)
+    fh = request.urlopen(url)
+    data = fh.read().decode('utf-8')
+    fh.close()
+    jdict = json.loads(data)
+    elon,elat,edepth = jdict['geometry']['coordinates']
+    emag = jdict['properties']['mag']
+    etime = datetime.datetime.utcfromtimestamp(int(jdict['properties']['time']/1000))
+    enet = jdict['properties']['net']
+    eloc = jdict['properties']['title']
+    geotype = 'cdi_geo.xml'
+    ziptype = 'cdi_zip.xml'
+    cditype = None
+    if cdifile is None:
+        dyfi_products = jdict['properties']['products']['dyfi'][0]['contents'].keys()
+        if geotype in dyfi_products:
+            purl = jdict['properties']['products']['dyfi'][0]['contents']['cdi_geo.xml']['url']
+            cditype = geotype
+        elif ziptype in dyfi_products:
+            purl = jdict['properties']['products']['dyfi'][0]['contents']['cdi_zip.xml']['url']
+            cditype = ziptype
+        else:
+            return (None,None,None,None)
+
+        fh = request.urlopen(purl)
+        cdidata = fh.read().decode('ascii',errors='ignore')
+        fh.close()
+    else:
+        cdidata = open(cdifile,'rt').read()
+        fpath,ffile = os.path.split(cdidata)
+        cditype = ffile
+
+    xmlstr = '''<shakemap-data code_version="[CODE_VERSION]" map_version="[SHAKE_VERSION]">
+    <earthquake id="[EVENTID]" lat="[LAT]" lon="[LON]" mag="[MAG]" 
+    year="[YEAR]" month="[MONTH]" day="[DAY]" hour="[HOUR]" minute="[MINUTE]" second="[SECOND]" 
+    timezone="GMT" depth="[DEPTH]" network="[NET]" locstring="[LOCSTR]" created="[CTIME]"/>
+    <stationlist>
+    '''
+    xmlstr = xmlstr.replace('[CODE_VERSION]',code_version)
+    xmlstr = xmlstr.replace('[SHAKE_VERSION]',shake_version)
+    xmlstr = xmlstr.replace('[EVENTID]',eventid)
+    xmlstr = xmlstr.replace('[LAT]','%.4f' % elat)
+    xmlstr = xmlstr.replace('[LON]','%.4f' % elon)
+    xmlstr = xmlstr.replace('[MAG]','%.1f' % emag)
+    xmlstr = xmlstr.replace('[YEAR]','%i' % etime.year)
+    xmlstr = xmlstr.replace('[MONTH]','%i' % etime.month)
+    xmlstr = xmlstr.replace('[DAY]','%i' % etime.day)
+    xmlstr = xmlstr.replace('[HOUR]','%i' % etime.hour)
+    xmlstr = xmlstr.replace('[MINUTE]','%i' % etime.minute)
+    xmlstr = xmlstr.replace('[SECOND]','%i' % etime.second)
+    xmlstr = xmlstr.replace('[DEPTH]','%.2f' % edepth)
+    xmlstr = xmlstr.replace('[NET]',enet)
+    xmlstr = xmlstr.replace('[LOCSTR]',eloc)
+    xmlstr = xmlstr.replace('[CTIME]','%i' % calendar.timegm(time.gmtime()))
+    #remember to fill in macros with information from original json
+    
+    station_template = '''<station code="[CODE]" name="[NAME]" insttype="OBSERVED" lat="[LAT]" lon="[LON]" dist="[DIST]" source="USGS (Did You Feel It?)" netid="DYFI" commtype="" loc="" intensity="[CDI]"/>\n\n  
+    '''
+    dom = minidom.parseString(cdidata)
+    root = dom.getElementsByTagName('cdidata')[0]
+    cdi = root.getElementsByTagName('cdi')[0]
+    locations = cdi.getElementsByTagName('location')
+    lcode = 1
+    nstations = 0
+    for location in locations:
+        name = location.getAttribute('name')
+        cdi = float(location.getElementsByTagName('cdi')[0].firstChild.data)
+        dist = float(location.getElementsByTagName('dist')[0].firstChild.data)
+        lat = float(location.getElementsByTagName('lat')[0].firstChild.data)
+        lon = float(location.getElementsByTagName('lon')[0].firstChild.data)
+        nresp = int(location.getElementsByTagName('nresp')[0].firstChild.data)
+        if nresp < minresp:
+            sys.stderr.write('Skipping DYFI result %s with %i responses...\n' % (name,nresp))
+            continue
+        nstations += 1
+        station = station_template.replace('[CODE]',str(lcode))
+        station = station.replace('[NAME]',name)
+        station = station.replace('[LAT]','%.4f' % lat)
+        station = station.replace('[LON]','%.4f' % lon)
+        station = station.replace('[DIST]','%i' % dist)
+        station = station.replace('[CDI]','%.4f' % cdi)
+        xmlstr += station
+        lcode += 1
+    root.unlink()
+    xmlstr += '</stationlist>\n</shakemap-data>'
+    return (xmlstr,cdidata,cditype,nstations)
+
+def get_shake_version(gridfile):
+    f = open(gridfile,'rt')
+    data = f.read()
+    token = 'shakemap_version="'
+    idx = data.find(token)
+    idx2 = data.find('"',idx+len(token))
+    shakeversion = data[idx+len(token):idx2].replace('"','')
+    f.close()
+    return shakeversion
+
+if __name__ == '__main__':
+    helptext = '''
+    Copy DYFI CDI summary file from DYFI online server and do the
+    necessary conversion for ShakeMap. Program will retrieve
+    geocoded data if it is available, otherwise it will retrieve
+    zip-coded data.'''
+
+    parser = argparse.ArgumentParser(description=helptext,formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument('-event', dest='eventid', help='Specifies the id of the event to process, required')
+    parser.add_argument('-network', dest='network', help='Specify network code (default: us)',default='us')
+    parser.add_argument('-file', dest='file', help="Specifies a local file (don't access the web)")
+    parser.add_argument('-minresp', dest='minresp', 
+                        help="Don't get locations with fewer responses than this (default: 3).",
+                        default=3,type=int)
+    ziphelp = """By default, the program will retrieve geocoded data
+    if it exists. This flag forces the program to
+    retrieve zip-coded data.
+    """
+    parser.add_argument('-zip', dest='getZip', help=ziphelp)
+    args = parser.parse_args()
+
+    if not args.eventid: 
+        print "Error in getdyfi2, use options -event and optionally -network (default=us)"
+        sys.exit(-1)
+    
+    CODEVERSION = '3.5'
+    homedir = os.environ.get('SHAKE_HOME') # returns None if no such env variable
+    if not homedir:
+         homedir = os.path.dirname(os.path.abspath(__file__)) + "/../" #where is this script?
+    datadir = os.path.join(homedir,'data',args.eventid)
+    gridfile = os.path.join(datadir,'output','grid.xml')
+    if not os.path.isfile(gridfile):
+        shakeversion = '1'
+    else:
+        shakeversion = get_shake_version(gridfile)
+    xmlstr,cdidata,cdiname,nstations = getcdifile(args.network,args.eventid,CODEVERSION,shakeversion,minresp=args.minresp,cdifile=args.file)
+    if xmlstr is not None:
+        xmlout = os.path.abspath(os.path.join(datadir,'input','dyfi_dat.xml'))
+        rawfolder = os.path.join(datadir,'raw')
+        if not os.path.isdir(rawfolder):
+            os.makedirs(rawfolder)
+        cdiout = os.path.abspath(os.path.join(rawfolder,cdiname))
+        f = open(xmlout,'wt')
+        f.write(xmlstr)
+        f.close()
+        print('Wrote %i observations of DYFI XML data to %s.' % (nstations,xmlout))
+
+        f = open(cdiout,'wt')
+        f.write(cdidata)
+        f.close()
+        print('Wrote %i observations of DYFI raw XML data to %s.' % (nstations,cdiout))
+    else:
+        print('No DYFI data found for event %s' % args.eventid)
+    
+
+    
+
