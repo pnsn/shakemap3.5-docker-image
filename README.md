@@ -11,3 +11,5 @@ Inside the /directory/of/your/choice:
 
 if you are part of the docker group you do not need to use sudo.
 
+# Example uses
+* https://github.com/pnsn/example-shakemap-docker-app
